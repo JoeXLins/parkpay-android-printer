@@ -4,7 +4,9 @@ import android.Manifest
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothSocket
+import android.content.Intent
 import android.graphics.Bitmap
+import android.net.Uri
 import android.os.Bundle
 import android.util.Log
 import android.view.View
@@ -18,9 +20,15 @@ import androidx.core.content.ContextCompat
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions
+import fi.iki.elonen.NanoHTTPD
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody
+import org.json.JSONObject
 import java.io.OutputStream
 import java.util.*
 import kotlin.math.ceil
@@ -38,6 +46,11 @@ class MainActivity : AppCompatActivity() {
     private val bluetoothAdapter: BluetoothAdapter? = BluetoothAdapter.getDefaultAdapter()
     private var selectedDevice: BluetoothDevice? = null
 
+    // Local embedded server
+    private var localServer: LocalServer? = null
+    private val LOCAL_SERVER_PORT = 8080
+    private val LOCAL_HOST = "http://127.0.0.1:$LOCAL_SERVER_PORT"
+
     private val requiredPermissions = arrayOf(
         Manifest.permission.CAMERA,
         Manifest.permission.ACCESS_FINE_LOCATION,
@@ -48,7 +61,7 @@ class MainActivity : AppCompatActivity() {
     private val requestPermissionsLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { perms ->
-        // no-op; assume user accepted for dev convenience
+        // no-op
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -77,6 +90,21 @@ class MainActivity : AppCompatActivity() {
         btnSettlePrint.setOnClickListener {
             settleAndPrint()
         }
+
+        // Start local embedded server for demo
+        localServer = LocalServer(LOCAL_SERVER_PORT, "local-demo-secret")
+        try {
+            localServer?.start(NanoHTTPD.SOCKET_READ_TIMEOUT, true)
+            Toast.makeText(this, "本地 server 启动: $LOCAL_HOST", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            e.printStackTrace()
+            Toast.makeText(this, "启动本地 server 失败: ${e.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        try { localServer?.stop() } catch (e: Exception) { }
     }
 
     private fun startCamera() {
@@ -105,7 +133,7 @@ class MainActivity : AppCompatActivity() {
                 imageProxy.close()
             }
             override fun onError(exception: ImageCaptureException) {
-                Toast.makeText(this@MainActivity, "拍照失败: ${'$'}{exception.message}", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this@MainActivity, "拍照失败: ${exception.message}", Toast.LENGTH_SHORT).show()
             }
         })
     }
@@ -120,7 +148,7 @@ class MainActivity : AppCompatActivity() {
                 val rawText = visionText.text
                 val plate = PlateExtractor.extractPlate(rawText)
                 runOnUiThread {
-                    tvPlate.text = "识别到车牌：${'$'}{plate ?: "未识别"}"
+                    tvPlate.text = "识别到车牌：${plate ?: "未识别"}"
                     if (plate != null) etPlateManual.setText(plate)
                 }
             }
@@ -141,12 +169,12 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "没有已配对的蓝牙设备，请先在系统设置配对打印机", Toast.LENGTH_SHORT).show()
             return
         }
-        val names = paired.map { "${'$'}{it.name ?: "未知"}\n${'$'}{it.address}" }.toTypedArray()
+        val names = paired.map { "${it.name ?: "未知"}\n${it.address}" }.toTypedArray()
         AlertDialog.Builder(this)
             .setTitle("选择打印机")
             .setItems(names) { _, which ->
                 selectedDevice = paired[which]
-                Toast.makeText(this, "已选择：${'$'}{paired[which].name}", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "已选择：${paired[which].name}", Toast.LENGTH_SHORT).show()
             }
             .show()
     }
@@ -167,29 +195,44 @@ class MainActivity : AppCompatActivity() {
         val endAt = Date()
         val minutes = ceil((endAt.time - startAt.time) / 60000.0).toInt()
         val amountCents = calculateFee(minutes)
-        val amountYuanText = String.format("%d.%02d", amountCents / 100, amountCents % 100)
 
-        // 生成支付链接（生产环境换成后端返回）
-        val payUrl = "http://10.0.2.2:3000/pay?session=demo-${'$'}{UUID.randomUUID()}&amount=${'$'}{amountCents/100}"
+        // Create payment on local embedded server
+        val publicHost = LOCAL_HOST
+        val sessionId = "demo-${UUID.randomUUID()}"
 
-        val qrBitmap = QrGenerator.generate(payUrl, 300)
-
-        val receipt = buildReceiptText(plate, startAt, endAt, minutes, amountCents)
-
-        // 打印（在协程中）
         CoroutineScope(Dispatchers.IO).launch {
+            var payUrl: String? = null
+            try {
+                payUrl = createPaymentOnServer(publicHost, sessionId, amountCents)
+            } catch (e: Exception) { e.printStackTrace() }
+            if (payUrl == null) {
+                runOnUiThread { Toast.makeText(this@MainActivity, "无法从本地 server 获取支付链接", Toast.LENGTH_LONG).show() }
+                return@launch
+            }
+            val qrBitmap = QrGenerator.generate(payUrl, 300)
+            val receipt = buildReceiptText(plate, startAt, endAt, minutes, amountCents)
+
             try {
                 val socket = createRfcommSocket(selectedDevice!!)
                 socket.connect()
                 val out: OutputStream = socket.outputStream
-                // 打印
-                EscPosPrinter.printReceipt(out, receipt, qrBitmap)
+                EscPosPrinter.printReceipt(out, receipt + "\n", qrBitmap)
                 out.close()
                 socket.close()
-                runOnUiThread { Toast.makeText(this@MainActivity, "打印成功", Toast.LENGTH_SHORT).show() }
+                runOnUiThread {
+                    Toast.makeText(this@MainActivity, "打印成功", Toast.LENGTH_SHORT).show()
+                    AlertDialog.Builder(this@MainActivity)
+                        .setTitle("支付链接已生成")
+                        .setMessage(payUrl)
+                        .setPositiveButton("在浏览器打开") { _, _ ->
+                            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(payUrl)))
+                        }
+                        .setNegativeButton("关闭", null)
+                        .show()
+                }
             } catch (e: Exception) {
                 e.printStackTrace()
-                runOnUiThread { Toast.makeText(this@MainActivity, "打印失败: ${'$'}{e.message}", Toast.LENGTH_LONG).show() }
+                runOnUiThread { Toast.makeText(this@MainActivity, "打印失败: ${e.message}", Toast.LENGTH_LONG).show() }
             }
         }
     }
@@ -206,11 +249,11 @@ class MainActivity : AppCompatActivity() {
     private fun buildReceiptText(plate: String, start: Date, end: Date, minutes: Int, amountCents: Int): String {
         return """
             停车小票
-            车牌: ${'$'}plate
-            开始: ${'$'}start
-            结束: ${'$'}end
-            时长: ${'$'}{minutes} 分钟
-            金额: ${'$'}{amountCents/100}.${'$'}{(amountCents%100).toString().padStart(2,'0')} 元
+            车牌: $plate
+            开始: $start
+            结束: $end
+            时长: ${minutes} 分钟
+            金额: ${amountCents/100}.${(amountCents%100).toString().padStart(2,'0')} 元
 
             请扫码支付：
         """.trimIndent()
@@ -219,7 +262,23 @@ class MainActivity : AppCompatActivity() {
     // 创建 RFCOMM socket（使用常见 SPP UUID）
     private fun createRfcommSocket(device: BluetoothDevice): BluetoothSocket {
         val uuid = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
-        // 需要 BLUETOOTH_CONNECT 权限（在 Android 12+）
         return device.createRfcommSocketToServiceRecord(uuid)
+    }
+
+    // Network helper: call local server to create payment
+    suspend fun createPaymentOnServer(publicHost: String, session: String, amountCents: Int): String? {
+        val client = OkHttpClient()
+        val json = JSONObject().put("session", session).put("amount_cents", amountCents)
+        val body = RequestBody.create("application/json; charset=utf-8".toMediaTypeOrNull(), json.toString())
+        val req = Request.Builder()
+            .url("$publicHost/payments/create")
+            .post(body)
+            .build()
+        client.newCall(req).execute().use { resp ->
+            if (!resp.isSuccessful) return null
+            val respBody = resp.body?.string() ?: return null
+            val obj = JSONObject(respBody)
+            return obj.optString("pay_url", null)
+        }
     }
 }
